@@ -33,3 +33,9 @@ skip a local change.
 of point-in-time table discovery and remote correctness. Its header maps the
 individual behaviors to the patch so an upstreamed fix can be removed without
 reconstructing the change from the amalgamation.
+
+`0002-emscripten-fetch-transport.patch` routes the HTTP remote client through
+the browser's synchronous Emscripten Fetch API on `wasm32-unknown-emscripten`,
+where BSD sockets and the bundled mbedTLS are unavailable. It is guarded
+entirely by `__EMSCRIPTEN__`, so native and other targets compile byte-for-byte
+identically. The final module must be linked with `-sFETCH=1`.
