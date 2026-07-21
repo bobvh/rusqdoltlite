@@ -1,0 +1,95 @@
+Trust this connection's own just-committed refs in chunkStoreForceRefresh.
+
+chunkStoreForceRefresh's fast path (csDiskStateMatchesMemory) proves the
+on-disk store still matches memory by stat-ing the file and reading its tail
+root record through the chunk store's own long-lived file handle. On native
+VFSes a write made through that handle is immediately visible to a stat on
+the same handle, so the fast path reliably fires right after this
+connection's own commit.
+
+Emscripten's DriveFS (used by the wasm build to share a filesystem across
+worker threads) does not have that property: writes are buffered on the open
+stream and only pushed back to the backing store when the stream is closed,
+but stat/getattr calls are served from the backing store regardless of any
+still-open writer. So on wasm, csDiskStateMatchesMemory's stat-based check
+reports a same-connection commit as stale even though nothing actually
+changed, which sends chunkStoreForceRefresh down the reload path. Right
+after `dolt_clone`, that reload replaces the in-memory refs table with a
+fresh (but, per the DriveFS quirk above, momentarily still-stale) view that
+is missing the `origin` remote `dolt_clone` itself just added, so the very
+next statement -- `dolt_remote('set-url', 'origin', ...)`, run by
+rusqdoltlite to restore the canonical clone URL -- fails with
+SQLITE_NOTFOUND ("remote not found").
+
+Add a one-shot ChunkStore::bTrustLocalAfterCommit flag: chunkStoreCommit
+sets it after a successful on-disk commit, and chunkStoreForceRefresh's fast
+path treats it as equivalent to csDiskStateMatchesMemory returning true,
+clearing it either way once consumed. This only ever short-circuits the very
+next force-refresh immediately following this connection's own commit; any
+later reload (uncommitted local writes, or a fast-path miss for any other
+reason) still goes through the normal disk-verified path unchanged.
+
+diff --git a/doltlite.c b/doltlite.c
+index 360f935..1bcacc3 100644
+--- a/doltlite.c
++++ b/doltlite.c
+@@ -23646,6 +23646,18 @@ struct ChunkStore {
+ 
+   /* Prevent checkpoint reentry through VFS write hooks. */
+   int checkpointActive;
++
++  /* Set right after this connection's own chunkStoreCommit persists refs to
++  ** disk; consumed (cleared) by the very next chunkStoreForceRefresh call.
++  ** Some VFS backends (notably Emscripten's DriveFS, used by the wasm build)
++  ** only make a written file's stat/size visible to callers after the
++  ** writing stream is closed, so csDiskStateMatchesMemory's disk probe can
++  ** report a same-connection commit as stale even though nothing changed.
++  ** This flag lets the immediate post-commit refresh trust the state it
++  ** just wrote instead of tripping the reload path, avoiding a spurious
++  ** "remote not found" warning from statements like dolt_remote('set-url')
++  ** that immediately follow a clone/pull on the same connection. */
++  u8 bTrustLocalAfterCommit;
+ };
+ 
+ void csManifestSeal(u8 *aBuf);
+@@ -97405,6 +97417,18 @@ struct ChunkStore {
+ 
+   /* Prevent checkpoint reentry through VFS write hooks. */
+   int checkpointActive;
++
++  /* Set right after this connection's own chunkStoreCommit persists refs to
++  ** disk; consumed (cleared) by the very next chunkStoreForceRefresh call.
++  ** Some VFS backends (notably Emscripten's DriveFS, used by the wasm build)
++  ** only make a written file's stat/size visible to callers after the
++  ** writing stream is closed, so csDiskStateMatchesMemory's disk probe can
++  ** report a same-connection commit as stale even though nothing changed.
++  ** This flag lets the immediate post-commit refresh trust the state it
++  ** just wrote instead of tripping the reload path, avoiding a spurious
++  ** "remote not found" warning from statements like dolt_remote('set-url')
++  ** that immediately follow a clone/pull on the same connection. */
++  u8 bTrustLocalAfterCommit;
+ };
+ 
+ void csManifestSeal(u8 *aBuf);
+@@ -277295,6 +277319,7 @@ int chunkStoreCommit(ChunkStore *cs){
+     acquiredLock = 1;
+   }
+   rc = csCommitToFile(cs);
++  if( rc==SQLITE_OK ) cs->bTrustLocalAfterCommit = 1;
+   if( acquiredLock ) chunkStoreUnlock(cs);
+   return rc;
+ }
+@@ -277484,9 +277509,12 @@ int chunkStoreForceRefresh(ChunkStore *cs){
+   ** matches this handle's state, the reload — which replays the entire WAL —
+   ** is a no-op and can be skipped. Local uncommitted appends fall through so
+   ** the reload path keeps reporting SQLITE_BUSY_SNAPSHOT. */
+-  if( cs->staging.nRecentUncommitted==0 && csDiskStateMatchesMemory(cs) ){
++  if( cs->staging.nRecentUncommitted==0
++   && (csDiskStateMatchesMemory(cs) || cs->bTrustLocalAfterCommit) ){
++    cs->bTrustLocalAfterCommit = 0;
+     return SQLITE_OK;
+   }
++  cs->bTrustLocalAfterCommit = 0;
+   /* Reload even under a pinned snapshot — the VC write needs the true on-disk
+   ** branch tips. Unpin around it (the heuristic refresh path suppresses reloads
+   ** while pinned), then restore the pin. */

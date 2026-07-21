@@ -33,3 +33,15 @@ skip a local change.
 of point-in-time table discovery and remote correctness. Its header maps the
 individual behaviors to the patch so an upstreamed fix can be removed without
 reconstructing the change from the amalgamation.
+
+`0003-force-refresh-trust-local-commit.patch` lets `chunkStoreForceRefresh`
+trust the refs this connection just committed instead of re-verifying them
+against disk. `csDiskStateMatchesMemory`'s disk probe assumes a stat/read on
+a still-open file handle reflects that same handle's own prior writes, which
+holds on native VFSes but not on Emscripten's DriveFS (writes only reach the
+backing store when the writing stream closes). Without this patch, the very
+first force-refresh after a wasm `dolt_clone` sees a stale, remote-less refs
+table and the immediately following `dolt_remote('set-url', ...)` (used to
+restore the clone's canonical URL) fails with "remote not found". Applies to
+all targets, not only Emscripten, since the one-shot flag is a strict
+narrowing of an already-fast path.
