@@ -1,41 +1,35 @@
 Emscripten browser HTTP transport for the DoltLite remote client.
 
-Native builds reach a dolt remote through BSD sockets and (for https) the
-bundled mbedTLS; neither exists inside a WebAssembly page. On Emscripten this
-routes every request through the browser's own networking via the synchronous
-Emscripten Fetch API instead, leaving the entire sync algorithm and its
-status-code handling untouched -- only the byte transport under httpRequest()
-changes. https is also permitted on Emscripten (browser-terminated TLS, no
-mbedTLS), and the capability URL carries authorization so no bearer-token layer
-is needed. Requires linking the final module with -sFETCH=1.
-
-Guarded entirely by __EMSCRIPTEN__, so native/other targets are byte-identical.
+- native builds reach a dolt remote via BSD sockets + (for https) mbedTLS;
+  neither exists inside a WebAssembly page
+- on Emscripten, routes every request through the browser's own networking via
+  the synchronous Emscripten Fetch API instead
+- only the byte transport under httpRequest() changes; sync algorithm and
+  status-code handling are untouched
+- https is permitted on Emscripten too (browser-terminated TLS, no mbedTLS);
+  the capability URL carries authorization, so no bearer-token layer is needed
+- requires linking the final module with -sFETCH=1
+- guarded entirely by __EMSCRIPTEN__, so native/other targets are byte-identical
 
 diff --git a/doltlite.c b/doltlite.c
-index 360f935..e14ba28 100644
+index 81a8e2e..c64fe97 100644
 --- a/doltlite.c
 +++ b/doltlite.c
-@@ -330998,6 +330998,92 @@ static int readUntilEof(HttpConn *conn, u8 **ppOut, int *pnOut){
+@@ -331932,6 +331932,85 @@ static int readUntilEof(HttpConn *conn, u8 **ppOut, int *pnOut){
    return SQLITE_OK;
  }
  
 +#if defined(__EMSCRIPTEN__)
 +#include <emscripten/fetch.h>
 +
-+/* Browser transport. Native builds reach the remote through BSD sockets and,
-+** for https, mbedTLS; neither exists inside a WebAssembly page, so on Emscripten
-+** every request is routed through the browser's own networking via the
-+** synchronous Emscripten Fetch API instead. Everything above this function --
-+** the dolt synchronization algorithms and their status-code handling -- is
-+** unchanged; only the byte transport differs.
-+**
-+** The capability URL already carries GenHub authorization, so no bearer-token
-+** layer is used here. TLS is terminated by the browser, so https needs no
-+** mbedTLS. Request and response bodies are passed by explicit length, and the
-+** response is copied out before the fetch handle is freed, so embedded NUL bytes
-+** and exact lengths are preserved. The HTTP status is returned verbatim, so the
-+** callers' existing 404 -> SQLITE_NOTFOUND, 409 -> SQLITE_BUSY, ... mapping is
-+** unaffected. Requires linking the final module with -sFETCH=1. */
++/* Browser transport (BSD sockets/mbedTLS don't exist in a WebAssembly page):
++** - routes each request through the browser's synchronous Emscripten Fetch API
++** - only the byte transport changes; sync algorithm and status handling don't
++** - capability URL carries auth, so no bearer-token header is needed here
++** - TLS is browser-terminated, so https needs no mbedTLS
++** - response is copied out by explicit length, preserving embedded NULs
++** - HTTP status is returned verbatim for the callers' existing status mapping
++** - requires linking the final module with -sFETCH=1 */
 +static int httpRequestFetch(
 +  HttpRemote *p,
 +  const char *zMethod,
@@ -76,10 +70,9 @@ index 360f935..e14ba28 100644
 +  sqlite3_free(zUrl);
 +  if( !fetch ) return SQLITE_ERROR;
 +
-+  /* status 0 is how the Fetch/XHR layer reports a transport-level failure
-+  ** (unreachable host, blocked CORS request, malformed URL); no HTTP server
-+  ** returns it. Any real status, including 4xx/5xx, is a completed exchange and
-+  ** is handed back to the caller unchanged. */
++  /* status 0: transport-level failure (unreachable host, CORS block, bad URL),
++  ** never a real HTTP server response. 4xx/5xx are completed exchanges and
++  ** pass through unchanged. */
 +  if( fetch->status==0 ){
 +    emscripten_fetch_close(fetch);
 +    return SQLITE_ERROR;
@@ -108,7 +101,7 @@ index 360f935..e14ba28 100644
  static int httpRequest(
    HttpRemote *p,
    const char *zMethod,
-@@ -331017,6 +331103,9 @@ static int httpRequest(
+@@ -331951,6 +332030,9 @@ static int httpRequest(
    *ppResp = 0;
    *pnResp = 0;
  
@@ -118,7 +111,7 @@ index 360f935..e14ba28 100644
    conn = httpConnOpen(p->zHost, p->port, p->useTls);
    if( !conn ) return SQLITE_ERROR;
  
-@@ -331137,6 +331226,7 @@ static int httpRequest(
+@@ -332071,6 +332153,7 @@ static int httpRequest(
    }
  
    return SQLITE_OK;
@@ -126,7 +119,7 @@ index 360f935..e14ba28 100644
  }
  
  static int uploadBufAppend(HttpRemote *p, const u8 *pData, int nData){
-@@ -331529,9 +331619,12 @@ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
+@@ -332463,9 +332546,12 @@ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
    if( !zUrl ) return 0;
  
    if( strncmp(zUrl, "https://", 8) == 0 ){

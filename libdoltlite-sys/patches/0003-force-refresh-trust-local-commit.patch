@@ -1,28 +1,24 @@
 Trust this connection's own just-committed refs in chunkStoreForceRefresh
 (Emscripten only).
 
-chunkStoreForceRefresh's fast path (csDiskStateMatchesMemory) proves the
-on-disk store still matches memory by stat-ing the file and reading its tail
-root record through the chunk store's own long-lived file handle. On native
-VFSes a write made through that handle is immediately visible to a stat on
-the same handle, so the fast path reliably fires right after this
-connection's own commit -- and just as reliably still catches a concurrent
-peer writer, since a peer's write changes the physical file size that stat
-reports.
-
-Emscripten's DriveFS (used by the wasm build to share a filesystem across
-worker threads) does not have the first property: writes are buffered on the
-open stream and only pushed back to the backing store when the stream is
-closed, but stat/getattr calls are served from the backing store regardless
-of any still-open writer. So on wasm, csDiskStateMatchesMemory's stat-based
-check reports a same-connection commit as stale even though nothing actually
-changed, which sends chunkStoreForceRefresh down the reload path. Right
-after `dolt_clone`, that reload replaces the in-memory refs table with a
-fresh (but, per the DriveFS quirk above, momentarily still-stale) view that
-is missing the `origin` remote `dolt_clone` itself just added, so the very
-next statement -- `dolt_remote('set-url', 'origin', ...)`, run by
-rusqdoltlite to restore the canonical clone URL -- fails with
-SQLITE_NOTFOUND ("remote not found").
+- chunkStoreForceRefresh's fast path (csDiskStateMatchesMemory) proves the
+  on-disk store matches memory by stat-ing the file and reading its tail root
+  record through the chunk store's own long-lived handle
+- on native VFSes a write through that handle is immediately visible to a stat
+  on the same handle, so the fast path fires right after this connection's own
+  commit, and still reliably catches a concurrent peer writer (whose write
+  changes the physical file size that stat reports)
+- Emscripten's DriveFS (shares a filesystem across worker threads) lacks the
+  first property: writes are buffered on the open stream and only pushed to
+  the backing store when the stream closes, but stat/getattr is served from
+  the backing store regardless of any still-open writer
+- so on wasm, the stat-based check reports a same-connection commit as stale
+  even though nothing changed, sending chunkStoreForceRefresh down the reload
+  path; right after `dolt_clone`, that reload replaces the in-memory refs
+  table with a fresh but momentarily still-stale view missing the `origin`
+  remote `dolt_clone` itself just added, so the very next statement --
+  `dolt_remote('set-url', 'origin', ...)`, run by rusqdoltlite to restore the
+  canonical clone URL -- fails with SQLITE_NOTFOUND ("remote not found")
 
 Add a one-shot ChunkStore::bTrustLocalAfterCommit flag, compiled in only
 under __EMSCRIPTEN__: chunkStoreCommit sets it after a successful on-disk
@@ -38,62 +34,54 @@ concurrent writer. Native and other non-Emscripten targets compile
 byte-for-byte identically to before this patch.
 
 diff --git a/doltlite.c b/doltlite.c
-index 360f935..a80a610 100644
+index 81a8e2e..83b9bb5 100644
 --- a/doltlite.c
 +++ b/doltlite.c
-@@ -23646,6 +23646,25 @@ struct ChunkStore {
+@@ -23646,6 +23646,21 @@ struct ChunkStore {
  
    /* Prevent checkpoint reentry through VFS write hooks. */
    int checkpointActive;
 +
 +#if defined(__EMSCRIPTEN__)
-+  /* Set right after this connection's own chunkStoreCommit persists refs to
-+  ** disk; consumed (cleared) by the very next chunkStoreForceRefresh call.
-+  ** Emscripten's DriveFS (used by the wasm build) only makes a written
-+  ** file's stat/size visible to callers after the writing stream is
-+  ** closed, so csDiskStateMatchesMemory's disk probe can report a
-+  ** same-connection commit as stale even though nothing changed. This flag
-+  ** lets the immediate post-commit refresh trust the state it just wrote
-+  ** instead of tripping the reload path, avoiding a spurious "remote not
-+  ** found" warning from statements like dolt_remote('set-url') that
-+  ** immediately follow a clone/pull on the same connection. Emscripten's
-+  ** execution model is synchronous and single-threaded, so there is no
-+  ** point between this connection's own commit and its very next statement
-+  ** where a peer could interleave a conflicting write -- unlike native,
-+  ** where trusting local state here would blind chunkStoreForceRefresh to
-+  ** a real concurrent writer, so this stays off outside Emscripten. */
++  /* One-shot flag, Emscripten only:
++  ** - set right after this connection's own chunkStoreCommit persists to disk
++  ** - consumed (cleared) by the very next chunkStoreForceRefresh call
++  ** - DriveFS only makes a written file's stat/size visible after the writing
++  **   stream closes, so csDiskStateMatchesMemory can report a same-connection
++  **   commit as stale even though nothing changed, tripping a spurious reload
++  **   that drops refs a just-run dolt_clone/dolt_remote('set-url') needs
++  ** - safe because Emscripten's execution model is synchronous and
++  **   single-threaded: nothing can interleave a conflicting write in this
++  **   window, unlike native, where this stays off so a real concurrent
++  **   writer is still caught */
 +  u8 bTrustLocalAfterCommit;
 +#endif
  };
  
  void csManifestSeal(u8 *aBuf);
-@@ -97405,6 +97424,25 @@ struct ChunkStore {
+@@ -97432,6 +97447,21 @@ struct ChunkStore {
  
    /* Prevent checkpoint reentry through VFS write hooks. */
    int checkpointActive;
 +
 +#if defined(__EMSCRIPTEN__)
-+  /* Set right after this connection's own chunkStoreCommit persists refs to
-+  ** disk; consumed (cleared) by the very next chunkStoreForceRefresh call.
-+  ** Emscripten's DriveFS (used by the wasm build) only makes a written
-+  ** file's stat/size visible to callers after the writing stream is
-+  ** closed, so csDiskStateMatchesMemory's disk probe can report a
-+  ** same-connection commit as stale even though nothing changed. This flag
-+  ** lets the immediate post-commit refresh trust the state it just wrote
-+  ** instead of tripping the reload path, avoiding a spurious "remote not
-+  ** found" warning from statements like dolt_remote('set-url') that
-+  ** immediately follow a clone/pull on the same connection. Emscripten's
-+  ** execution model is synchronous and single-threaded, so there is no
-+  ** point between this connection's own commit and its very next statement
-+  ** where a peer could interleave a conflicting write -- unlike native,
-+  ** where trusting local state here would blind chunkStoreForceRefresh to
-+  ** a real concurrent writer, so this stays off outside Emscripten. */
++  /* One-shot flag, Emscripten only:
++  ** - set right after this connection's own chunkStoreCommit persists to disk
++  ** - consumed (cleared) by the very next chunkStoreForceRefresh call
++  ** - DriveFS only makes a written file's stat/size visible after the writing
++  **   stream closes, so csDiskStateMatchesMemory can report a same-connection
++  **   commit as stale even though nothing changed, tripping a spurious reload
++  **   that drops refs a just-run dolt_clone/dolt_remote('set-url') needs
++  ** - safe because Emscripten's execution model is synchronous and
++  **   single-threaded: nothing can interleave a conflicting write in this
++  **   window, unlike native, where this stays off so a real concurrent
++  **   writer is still caught */
 +  u8 bTrustLocalAfterCommit;
 +#endif
  };
  
  void csManifestSeal(u8 *aBuf);
-@@ -277295,6 +277333,9 @@ int chunkStoreCommit(ChunkStore *cs){
+@@ -277329,6 +277359,9 @@ int chunkStoreCommit(ChunkStore *cs){
      acquiredLock = 1;
    }
    rc = csCommitToFile(cs);
@@ -103,7 +91,7 @@ index 360f935..a80a610 100644
    if( acquiredLock ) chunkStoreUnlock(cs);
    return rc;
  }
-@@ -277484,9 +277525,18 @@ int chunkStoreForceRefresh(ChunkStore *cs){
+@@ -277518,9 +277551,18 @@ int chunkStoreForceRefresh(ChunkStore *cs){
    ** matches this handle's state, the reload — which replays the entire WAL —
    ** is a no-op and can be skipped. Local uncommitted appends fall through so
    ** the reload path keeps reporting SQLITE_BUSY_SNAPSHOT. */
